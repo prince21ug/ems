@@ -1,0 +1,929 @@
+import PlantPageHeader, { PlantToolbar } from '../components/PlantPageChrome';
+import ConsumptionBreakdownView from '../components/ConsumptionBreakdownView';
+import ProductionBreakdownView from '../components/ProductionBreakdownView';
+import { productionChartData } from '../utils/productionChartData';
+import {FuelSelector,FuelReferenceNotice,TotalFormulaControl,useAugustFuelEquipment,formulaLabel} from '../components/FuelControls';
+import SeuButton from '../components/SeuButton';
+import { quantityMonth, calculateRows, toInputRows, defaultFormula, validateFormula } from '../utils/fuelConversion';
+import { prepareFuelSpreadsheet, fuelSampleRows } from '../utils/fuelSpreadsheet';
+import EnpiBreakdownView from '../components/EnpiBreakdownView';
+import EnpiTargets from '../components/EnpiTargets';
+import PlantQrCodes, { useEquipmentQrTarget } from '../components/PlantQrCodes';
+import ResponsiveContainer from '../components/ExpandableChart';
+import '../styles/plant-themes.css';
+import '../styles/plant-audit.css';
+import { monthFromUrl } from '../utils/monthFromUrl';
+import ScheduleButton from '../components/ScheduleButton';
+import EquipmentBarCharts from '../components/EquipmentBarCharts';
+import DataLoadNotice from '../components/DataLoadNotice';
+import { API_BASE_URL, apiFetch } from '../config/api';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import * as XLSX from 'xlsx';
+import { PieChart, Pie, Cell, Tooltip, Legend } from 'recharts';
+import {
+  UploadCloud, Download, Save, TrendingUp,
+  FileSpreadsheet, X, Calendar, Lock, XCircle
+} from 'lucide-react';
+
+// Permanent 22 Process / Equipments list according to plant layout with distinct badges
+const PERMANENT_EQUIPMENTS = [
+  { equipment: "HR -SLITTER 20MM", enpiUnit: "KwH/MT", labelBg: "#0284c7", textCol: "#ffffff" },
+  { equipment: "HR -SLITTER 10 MM", enpiUnit: "KwH/MT", labelBg: "#059669", textCol: "#ffffff" },
+  { equipment: "COMPRESSOR 1", enpiUnit: "KwH/CFM", labelBg: "#d97706", textCol: "#ffffff" },
+  { equipment: "PUMP HOUSE", enpiUnit: "KwH/MT", labelBg: "#ea580c", textCol: "#ffffff" },
+  { equipment: "ROAD LIGHT", enpiUnit: "KwH/MT", labelBg: "#e11d48", textCol: "#ffffff" },
+  { equipment: "SHED LIGHT ZY-500 MILL", enpiUnit: "KwH/MT", labelBg: "#0891b2", textCol: "#ffffff" },
+  { equipment: "STORE", enpiUnit: "KwH/MT", labelBg: "#9333ea", textCol: "#ffffff" },
+  { equipment: "CIVIL AMRON WEIGH BRIDGE", enpiUnit: "KwH/MT", labelBg: "#0d9488", textCol: "#ffffff" },
+  { equipment: "ZY-120 MILL", enpiUnit: "KwH/MT", labelBg: "#c2410c", textCol: "#ffffff" },
+  { equipment: "FD-200 MILL", enpiUnit: "KwH/MT", labelBg: "#7c3aed", textCol: "#ffffff" },
+  { equipment: "OLIMPIA MILL", enpiUnit: "KwH/MT", labelBg: "#db2777", textCol: "#ffffff" },
+  { equipment: "NEW HSU OFFICE", enpiUnit: "KwH/MT", labelBg: "#65a30d", textCol: "#ffffff" },
+  { equipment: "CANTEEN", enpiUnit: "KwH/MT", labelBg: "#38bdf8", textCol: "#000000" },
+  { equipment: "STP", enpiUnit: "KwH/MT", labelBg: "#4ade80", textCol: "#000000" },
+  { equipment: "ZY-500 MILL+1800KWHF", enpiUnit: "KwH/MT", labelBg: "#facc15", textCol: "#000000" },
+  { equipment: "CTL", enpiUnit: "KwH/MT", labelBg: "#fb923c", textCol: "#000000" },
+  { equipment: "STORAGE SHED", enpiUnit: "KwH/MT", labelBg: "#22d3ee", textCol: "#000000" },
+  { equipment: "UPS", enpiUnit: "KwH/MT", labelBg: "#c084fc", textCol: "#000000" },
+  { equipment: "COMPRESSOR 2", enpiUnit: "KwH/CFM", labelBg: "#f472b6", textCol: "#000000" },
+  { equipment: "ZY-80 MILL", enpiUnit: "KwH/MT", labelBg: "#a3e635", textCol: "#000000" },
+  { equipment: "MATERIAL HANDLING & OTHER WORKS ( Diesel+ LPG)", enpiUnit: "Ltr/Hrs", labelBg: "#94a3b8", textCol: "#000000" },
+  { equipment: "LOSSES", enpiUnit: "KwH/MT", labelBg: "#e879f9", textCol: "#000000" }
+];
+
+// Fixed Solid Color Codes for Columns
+const COL_COLORS = {
+  index: "#f1f5f9",
+  month: "#fef08a",
+  electricity: "#bbf7d0",
+  lpg: "#fed7aa",
+  hsd: "#e9d5ff",
+  total: "#a7f3d0",
+  production: "#bae6fd",
+  unit: "#ddd6fe",
+  enpiVal: "#fbcfe8",
+  wrt: "#fef08a",
+};
+
+const getInitialBlankRows = () => {
+  return PERMANENT_EQUIPMENTS.map(pe => ({
+    equipment: pe.equipment,
+    electricity: '',
+    lpg: '',
+    hsd: '',
+    totalConsumption: '',
+    production: '',
+    enpiUnit: pe.enpiUnit,
+    enpiValue: '---',
+    wrtKwh: ''
+  }));
+};
+
+// Consistent, readable equipment palette on light chart cards.
+const PIE_COLORS = [
+  '#2563eb', '#0d9488', '#d97706', '#7c3aed',
+  '#db2777', '#0891b2', '#65a30d', '#64748b'
+];
+
+const SAVE_AUTH_PASSWORD = "1234";
+
+export default function HsuPage() {
+  useEquipmentQrTarget();
+  const navigate = useNavigate();
+  const dateInputRef = useRef(null);
+
+  const [selectedMonth, setSelectedMonth] = useState(() => monthFromUrl());
+  const [rows, setRows] = useState(getInitialBlankRows());
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [noMonthData, setNoMonthData] = useState(false);
+  const [reloadAttempt, setReloadAttempt] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [formula,setFormula]=useState(null);
+  const [formulaDirty,setFormulaDirty]=useState(false);
+  const augustFuel=useAugustFuelEquipment('hsu');
+  const [showUploader, setShowUploader] = useState(false);
+
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [enteredPassword, setEnteredPassword] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setLoading(true);
+    setLoadError('');
+    setFormula(null);setFormulaDirty(false);
+    setShowPasswordModal(false);
+    setNoMonthData(false);
+    setRows(getInitialBlankRows());
+    apiFetch(`${API_BASE_URL}/api/hsu?month=${selectedMonth}`, { signal: controller.signal })
+      .then(res => res.json())
+      .then(data => {
+        if (!active) return;
+        if (data !== null && (!data || !Array.isArray(data.rows))) {
+          throw new Error('The data service returned an invalid record. Please retry.');
+        }
+        setFormula(Object.keys(data?.formula||{}).length?validateFormula(data.formula):null);
+        if (data?.rows?.length) {
+          const blanks = getInitialBlankRows();
+          // Saved equipment names are authoritative; do not discard legacy/new rows.
+          const merged = data.rows.map(row => {
+            const blank = blanks.find(item => item.equipment.trim().toUpperCase() === String(row.equipment || '').trim().toUpperCase()) || { ...blanks[0], equipment: row.equipment, enpiUnit: row.enpiUnit || '' };
+            return { ...blank, ...row, lpg: row.lpg ?? row.lng ?? row.lpg ?? row.lngLpg ?? blank.lpg };
+          });
+          setRows(toInputRows('hsu', selectedMonth, merged));
+        } else {
+          setNoMonthData(true);
+        }
+      })
+      .catch(error => {
+        if (!active || error.name === 'AbortError') return;
+        setLoadError(error.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [selectedMonth, reloadAttempt]);
+
+  const handleCellChange = (idx, field, value) => {
+    if (field==='fuelType'&&!quantityMonth(selectedMonth)&&!formula) {setRows(prev=>prev.map((row,i)=>i===idx?{...row,fuelType:value}:row));return;}
+    if (quantityMonth(selectedMonth)||formula) {
+      setRows(prev => calculateRows('hsu', prev.map((row, i) => i === idx ? { ...row, [field]: value } : row),formula||defaultFormula(selectedMonth),quantityMonth(selectedMonth)?'quantity-v1':'legacy-kwh'));
+      return;
+    }
+    setRows(prev => {
+      const next = [...prev];
+      next[idx] = { ...next[idx], [field]: value };
+
+      const elec = parseFloat(field === 'electricity' ? value : next[idx].electricity) || 0;
+      const lpg = parseFloat(field === 'lpg' ? value : next[idx].lpg) || 0;
+      const hsd = parseFloat(field === 'hsd' ? value : next[idx].hsd) || 0;
+      const total = elec + lpg + hsd;
+
+      if (field === 'electricity' || field === 'lpg' || field === 'hsd') {
+        next[idx].totalConsumption = total > 0 ? total : '';
+      }
+
+      const prod = parseFloat(field === 'production' ? value : next[idx].production) || 0;
+      const currentTotal = field === 'totalConsumption' ? (parseFloat(value) || 0) : total;
+      if (prod > 0 && currentTotal > 0) {
+        next[idx].enpiValue = (currentTotal / prod).toFixed(2);
+      }
+
+      return next;
+    });
+  };
+
+  const totals = useMemo(() => {
+    return rows.reduce((acc, curr) => ({
+      electricity: acc.electricity + (Number(curr.electricity) || 0),
+      lpg: acc.lpg + (Number(curr.lpg) || 0),
+      hsd: acc.hsd + (Number(curr.hsd) || 0),
+      totalConsumption: acc.totalConsumption + (Number(curr.totalConsumption) || 0),
+      production: acc.production + (Number(curr.production) || 0),
+      wrtKwh: acc.wrtKwh + (Number(curr.wrtKwh) || 0)
+    }), { electricity: 0, lpg: 0, hsd: 0, totalConsumption: 0, production: 0, wrtKwh: 0 });
+  }, [rows]);
+
+  const totalEnpiVal = totals.production > 0 ? (totals.totalConsumption / totals.production).toFixed(2) : "0.00";
+
+  // Pie Chart Data (ZY-120 MILL, FD-200 MILL, OLIMPIA MILL, ZY-500 MILL+1800KWHF + OTHERS)
+  const getCategorizedData = (key) => {
+    const mainKeys = [
+      'ZY-120 MILL',
+      'FD-200 MILL',
+      'OLIMPIA MILL',
+      'ZY-500 MILL+1800KWHF',
+      'ZY-500 MILL+1800 KWHF'
+    ];
+    let mainItems = [];
+    let othersVal = 0;
+
+    rows.forEach((r) => {
+      let rawVal = r[key];
+      let val = 0;
+      if (typeof rawVal === 'number') {
+        val = rawVal;
+      } else if (typeof rawVal === 'string' && rawVal.trim() !== '' && rawVal !== '---') {
+        val = parseFloat(rawVal.replace(/,/g, '')) || 0;
+      }
+
+      if (val > 0) {
+        const eqName = (r.equipment || '').trim().toUpperCase();
+        if (mainKeys.some(k => eqName === k.toUpperCase())) {
+          mainItems.push({ name: r.equipment, value: Number(val.toFixed(2)) });
+        } else {
+          othersVal += val;
+        }
+      }
+    });
+
+    if (othersVal > 0) {
+      mainItems.push({ name: 'OTHERS', value: Number(othersVal.toFixed(2)) });
+    }
+    return mainItems;
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const bstr = evt.target.result;
+        const wb = XLSX.read(bstr, { type: 'binary' });
+        const wsname = wb.SheetNames[0];
+        const ws = wb.Sheets[wsname];
+        const parsedData = prepareFuelSpreadsheet('hsu', selectedMonth, XLSX.utils.sheet_to_json(ws, {defval: ''}));
+
+        if (parsedData.length > 0) {
+          const mapped = rows.map(pe => {
+            const found = parsedData.find(item => 
+              (item["Process/Equipments"] || item["Equipment"] || item.equipment || "").trim().toUpperCase() === pe.equipment.trim().toUpperCase()
+            );
+
+            if (found) {
+              return {
+                equipment: pe.equipment,
+                fuelType: found['Fuel Type'] || pe.fuelType,
+                electricity: found["Electricity (Kwh)"] ?? found["Electricity"] ?? '',
+                lpg: found["LPG ( Kg)"] ?? found["LPG (Kg)"] ?? found["LPG"] ?? '',
+                hsd: found["HSD (Ltr)"] ?? found["HSD"] ?? '',
+                totalConsumption: found["Total Consumption"] ?? '',
+                production: found["Production (MT)"] ?? found["Production"] ?? '',
+                enpiUnit: found["EnPI"] || pe.enpiUnit,
+                enpiValue: found["EnPI Value(s)"] || found.enpiValue || "---",
+                wrtKwh: found["% WRT to Total KWH"] ?? found["% WRT"] ?? ''
+              };
+            }
+
+            return {
+              equipment: pe.equipment,
+              electricity: '',
+              lpg: '',
+              hsd: '',
+              totalConsumption: '',
+              production: '',
+              enpiUnit: pe.enpiUnit,
+              enpiValue: '---',
+              wrtKwh: ''
+            };
+          });
+
+          setRows(quantityMonth(selectedMonth)||formula ? calculateRows('hsu', mapped,formula||defaultFormula(selectedMonth),quantityMonth(selectedMonth)?'quantity-v1':'legacy-kwh') : mapped);
+          setNoMonthData(false);
+          setShowUploader(false);
+          alert('HSU Excel Data Uploaded Successfully! Click Save to store.');
+        } else {
+          alert('Excel file is empty!');
+        }
+      } catch (err) {
+        alert('Failed to read Excel: ' + err.message);
+      }
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  const handleDownloadSample = () => {
+    const exportData = rows.map(pe => {
+      const existing = rows.find(r => r.equipment === pe.equipment);
+      return {
+        "Process/Equipments": pe.equipment,
+        "Month-Year": selectedMonth,
+        "Electricity (Kwh)": existing?.electricity !== '' ? existing?.electricity : "",
+        "LPG ( Kg)": existing?.lpg !== '' ? existing?.lpg : "",
+        "HSD (Ltr)": existing?.hsd !== '' ? existing?.hsd : "",
+        "Total Consumption": existing?.totalConsumption !== '' ? existing?.totalConsumption : "",
+        "Production (MT)": existing?.production !== '' ? existing?.production : "",
+        "EnPI": pe.enpiUnit,
+        "EnPI Value(s)": existing?.enpiValue !== '' ? existing?.enpiValue : "---",
+        "% WRT to Total KWH": existing?.wrtKwh !== '' ? existing?.wrtKwh : ""
+      };
+    });
+
+    const ws = XLSX.utils.json_to_sheet(fuelSampleRows('hsu', selectedMonth, exportData, rows));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "HSU_Facility");
+    XLSX.writeFile(wb, `HSU_Facility_Template_${selectedMonth}.xlsx`);
+  };
+
+  const executeSave = async (formulaOverride = formula) => {
+    if (loading || loadError) return;
+    setSaving(true);
+    try {
+      if (quantityMonth(selectedMonth)||formulaOverride) {
+        const policy = await (await apiFetch(`${API_BASE_URL}/api/energy-policy`)).json();
+        if (policy.version !== 'quantity-v1'||policy.formulaVersion!=='factors-v1') throw new Error('Energy conversion service is updating. Please retry shortly.');
+      }
+      const res = await apiFetch(`${API_BASE_URL}/api/hsu/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          monthYear: selectedMonth,
+          inputBasis: quantityMonth(selectedMonth) ? 'quantity-v1' : 'legacy-kwh',
+          formula: formulaOverride || undefined,
+          rows: formulaOverride?calculateRows('hsu',rows,formulaOverride,quantityMonth(selectedMonth)?'quantity-v1':'legacy-kwh'):rows,
+          totals: {
+            ...totals,
+            lng: totals.lpg,
+            enpiValue: Number(totalEnpiVal) || 0
+          }
+        })
+      });
+      const resData = await res.json();
+      if (resData.success) {
+        setFormula(Object.keys(resData.data?.formula||{}).length?validateFormula(resData.data.formula):null);setFormulaDirty(false);
+        if (resData.data?.rows) setRows(toInputRows('hsu', selectedMonth, resData.data.rows));
+        setNoMonthData(false);
+        alert('HSU Data successfully saved in MongoDB Database!');
+      } else {
+        alert('Save error: ' + (resData.error || 'Unknown error'));
+      }
+    } catch (err) {
+      alert('Error saving data: ' + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handlePasswordSubmit = async (e) => {
+    e.preventDefault();
+    if (enteredPassword !== SAVE_AUTH_PASSWORD) {
+      setPasswordError("Galat Password! Sahi password enter karein.");
+      return;
+    }
+    setShowPasswordModal(false);
+    await executeSave();
+  };
+
+  const saveFormula = next => {
+    setFormula(next);setFormulaDirty(true);
+    setRows(prev=>calculateRows('hsu',prev,next,quantityMonth(selectedMonth)?'quantity-v1':'legacy-kwh'));
+    setPasswordError('');setEnteredPassword('');setShowPasswordModal(true);
+  };
+
+  return (
+    <div className="audit-page plant-theme plant-theme-hsu" style={{ display: 'flex', flexDirection: 'column', gap: '24px', padding: '24px', backgroundColor: '#020617', minHeight: '100vh', color: '#f8fafc', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+
+      {/* 1. TOP BRAND HEADING: BACK BUTTON + "H S U" (STRICT INLINE STYLES) */}
+      <PlantPageHeader title="HSU" subtitle="Facility Operations" month={selectedMonth} />
+
+      {/* 2. 5 ACTION BLOCKS - STRICT SINGLE ROW FORCED (ZERO WRAPPING) */}
+      <PlantToolbar>
+        {/* BLOCK 1: SELECT MONTH (CYAN / BLUE GRADIENT) */}
+        <div 
+          style={{ 
+            display: 'flex', 
+            flexShrink: 0, 
+            alignItems: 'center', 
+            background: 'linear-gradient(135deg, #0284c7 0%, #2563eb 100%)', 
+            padding: '8px 14px', 
+            borderRadius: '12px', 
+            border: '1px solid #38bdf8', 
+            boxShadow: '0 4px 12px rgba(2,132,199,0.35)' 
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '10px', textTransform: 'uppercase', fontWeight: '900', color: '#e0f2fe', letterSpacing: '1px' }}>
+              Select Month
+            </span>
+            <div 
+              onClick={() => dateInputRef.current?.showPicker?.() || dateInputRef.current?.focus()}
+              style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: 'rgba(0,0,0,0.6)', border: '1px solid rgba(255,255,255,0.3)', borderRadius: '8px', padding: '3px 10px', cursor: 'pointer', marginTop: '3px' }}
+            >
+              <input
+                ref={dateInputRef}
+                type="month"
+                disabled={saving} value={selectedMonth}
+                onChange={(e) => setSelectedMonth(e.target.value)}
+                style={{ background: 'transparent', border: 'none', outline: 'none', fontSize: '12px', fontWeight: '900', color: '#38bdf8', cursor: 'pointer' }}
+              />
+              <Calendar size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
+            </div>
+          </div>
+        </div>
+
+        {/* BLOCK 2: UPLOAD EXCEL (EMERALD GREEN GRADIENT) */}
+        <button 
+          onClick={() => setShowUploader((o) => !o)}
+          style={{ 
+            display: 'flex', 
+            flexShrink: 0, 
+            alignItems: 'center', 
+            gap: '8px', 
+            background: 'linear-gradient(135deg, #059669 0%, #10b981 100%)', 
+            color: '#ffffff', 
+            fontWeight: '900', 
+            fontSize: '12px', 
+            padding: '12px 18px', 
+            borderRadius: '12px', 
+            border: '1px solid #34d399', 
+            boxShadow: '0 4px 12px rgba(5,150,105,0.35)', 
+            cursor: 'pointer', 
+            whiteSpace: 'nowrap' 
+          }}
+        >
+          <UploadCloud size={16} strokeWidth={2.5} color="#ffffff" />
+          <span>Upload Excel</span>
+        </button>
+
+        {/* BLOCK 3: SAMPLE EXCEL (AMBER / ORANGE GRADIENT) */}
+        <button 
+          onClick={handleDownloadSample}
+          style={{ 
+            display: 'flex', 
+            flexShrink: 0, 
+            alignItems: 'center', 
+            gap: '8px', 
+            background: 'linear-gradient(135deg, #d97706 0%, #f97316 100%)', 
+            color: '#ffffff', 
+            fontWeight: '900', 
+            fontSize: '12px', 
+            padding: '12px 18px', 
+            borderRadius: '12px', 
+            border: '1px solid #fbbf24', 
+            boxShadow: '0 4px 12px rgba(217,119,6,0.35)', 
+            cursor: 'pointer', 
+            whiteSpace: 'nowrap' 
+          }}
+        >
+          <Download size={16} strokeWidth={2.5} color="#ffffff" />
+          <span>Sample Excel</span>
+        </button>
+
+        {/* BLOCK 4: SAVE (ROYAL PURPLE GRADIENT) */}
+        <button className="plant-primary-action"
+          onClick={() => {
+            setPasswordError("");
+            setEnteredPassword("");
+            setShowPasswordModal(true);
+          }}
+          disabled={saving || loading || Boolean(loadError)}
+          style={{ 
+            display: 'flex', 
+            flexShrink: 0, 
+            alignItems: 'center', 
+            gap: '8px', 
+            background: 'linear-gradient(135deg, #7c3aed 0%, #9333ea 100%)', 
+            color: '#ffffff', 
+            fontWeight: '900', 
+            fontSize: '12px', 
+            padding: '12px 20px', 
+            borderRadius: '12px', 
+            border: '1px solid #c084fc', 
+            boxShadow: '0 4px 12px rgba(124,58,237,0.35)', 
+            cursor: 'pointer', 
+            whiteSpace: 'nowrap',
+            opacity: saving || loading || loadError ? 0.5 : 1
+          }}
+        >
+          <Save size={16} strokeWidth={2.5} color="#ffffff" />
+          <span>{saving ? "Saving…" : "Save Data"}</span>
+        </button>
+
+        {/* BLOCK 5: YOY ANALYTICS (ROSE / PINK GRADIENT) */}
+        <button 
+          onClick={() => navigate('/hsu/yoy')}
+          style={{ 
+            display: 'flex', 
+            flexShrink: 0, 
+            alignItems: 'center', 
+            gap: '8px', 
+            background: 'linear-gradient(135deg, #e11d48 0%, #f43f5e 100%)', 
+            color: '#ffffff', 
+            fontWeight: '900', 
+            fontSize: '12px', 
+            padding: '12px 18px', 
+            borderRadius: '12px', 
+            border: '1px solid #fb7185', 
+            boxShadow: '0 4px 12px rgba(225,29,72,0.35)', 
+            cursor: 'pointer', 
+            whiteSpace: 'nowrap' 
+          }}
+        >
+          <TrendingUp size={16} strokeWidth={2.5} color="#ffffff" />
+          <span>YoY Analytics</span>
+        </button>
+        <ScheduleButton plant="hsu" />
+        <SeuButton plant="hsu" />
+        <PlantQrCodes plant="hsu" />
+      </PlantToolbar>
+
+      {/* PASSWORD CONFIRMATION MODAL */}
+      {showPasswordModal && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(2, 6, 23, 0.85)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: '16px' }}>
+          <div style={{ backgroundColor: '#0f172a', border: '2px solid #6366f1', borderRadius: '16px', padding: '24px', width: '100%', maxWidth: '380px', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.7)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', borderBottom: '1px solid #1e293b', paddingBottom: '12px', marginBottom: '16px' }}>
+              <div style={{ padding: '10px', backgroundColor: 'rgba(99, 102, 241, 0.2)', color: '#818cf8', borderRadius: '12px', border: '1px solid rgba(99, 102, 241, 0.3)' }}>
+                <Lock size={22} />
+              </div>
+              <div>
+                <h3 style={{ margin: 0, fontSize: '14px', fontWeight: '900', color: '#38bdf8', textTransform: 'uppercase', letterSpacing: '1px' }}>
+                  Authorization Required
+                </h3>
+                <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#fbbf24', fontWeight: 'bold' }}>
+                  Data save karne ke liye password (1234) enter karein.
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handlePasswordSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', color: '#a5b4fc', marginBottom: '6px' }}>
+                  Enter Password
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  value={enteredPassword}
+                  onChange={(e) => {
+                    setEnteredPassword(e.target.value);
+                    setPasswordError("");
+                  }}
+                  placeholder="••••"
+                  style={{ width: '100%', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '10px', padding: '10px 14px', fontSize: '13px', fontWeight: 'bold', color: '#ffffff', outline: 'none', boxSizing: 'border-box' }}
+                />
+                {passwordError && (
+                  <p style={{ margin: '6px 0 0 0', fontSize: '11px', fontWeight: 'bold', color: '#f43f5e', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <XCircle size={13} /> {passwordError}
+                  </p>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '8px', paddingTop: '10px', borderTop: '1px solid #1e293b' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowPasswordModal(false)}
+                  style={{ padding: '8px 16px', borderRadius: '10px', fontSize: '12px', fontWeight: 'bold', color: '#f43f5e', backgroundColor: 'transparent', border: 'none', cursor: 'pointer' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  style={{ padding: '8px 20px', backgroundColor: '#4f46e5', color: '#ffffff', borderRadius: '10px', fontSize: '12px', fontWeight: '900', border: 'none', cursor: 'pointer', boxShadow: '0 4px 12px rgba(79, 70, 229, 0.4)' }}
+                >
+                  Verify &amp; Save
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* DYNAMIC UPLOAD MODAL */}
+      {showUploader && (
+        <div style={{ padding: '16px', border: '2px dashed #10b981', borderRadius: '16px', backgroundColor: 'rgba(6, 78, 59, 0.25)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+            <div style={{ padding: '12px', backgroundColor: 'rgba(16, 185, 129, 0.2)', color: '#34d399', borderRadius: '12px', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+              <FileSpreadsheet size={26} />
+            </div>
+            <div>
+              <p style={{ margin: 0, fontSize: '12px', fontWeight: '900', color: '#34d399', textTransform: 'uppercase' }}>Select Excel (.xlsx, .xls) File</p>
+              <p style={{ margin: '4px 0 0 0', fontSize: '11px', fontWeight: 'bold', color: '#99f6e4' }}>Values automatically map to the {selectedMonth} dataset.</p>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <input
+              type="file"
+              accept=".xlsx, .xls"
+              disabled={saving} onChange={handleFileUpload}
+              style={{ fontSize: '12px', color: '#cbd5e1', cursor: 'pointer' }}
+            />
+            <button 
+              onClick={() => setShowUploader(false)}
+              style={{ padding: '6px', color: '#f43f5e', backgroundColor: 'transparent', border: 'none', cursor: 'pointer' }}
+            >
+              <X size={20} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      <FuelReferenceNotice state={augustFuel}/>
+      {formulaDirty&&<p className="formula-draft-note" role="status">Formula changes are not saved yet. Complete Save to store the formula and recalculated data.</p>}
+      {(quantityMonth(selectedMonth)||formula)&&<p className="fuel-reference">{formulaLabel(formula,selectedMonth)}</p>}
+      <DataLoadNotice loading={loading} error={loadError} empty={noMonthData} period={selectedMonth} onRetry={() => setReloadAttempt(attempt => attempt + 1)} />
+      {/* SOLID COLORFUL TABLE */}
+      <div className="equipment-grid-shell" style={{ backgroundColor: '#020617', borderRadius: '16px', border: '2px solid #1e293b', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)', overflow: 'hidden' }}>
+
+        <div className="audit-table-scroll" style={{ overflowX: 'auto', width: '100%' }}>
+          <table className="equipment-grid" style={{ width: '100%', minWidth: '1300px', fontSize: '12px', textAlign: 'center', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            
+            {/* STRICT COLUMN SIZING */}
+            <colgroup>
+              <col style={{ width: "45px" }} />  {/* # */}
+              <col style={{ width: "185px" }} /> {/* Equipment */}
+              <col style={{ width: "150px" }} /> {/* Month (BADA KIYA GAYA) */}
+              <col style={{ width: "135px" }} /> {/* Electricity */}
+              <col style={{ width: "115px" }} />  {/* LPG (CHOTA KIYA GAYA) */}
+              <col style={{ width: "110px" }} /> {/* HSD */}
+              <col style={{ width: "140px" }} /> {/* Total Consumption */}
+              <col style={{ width: "125px" }} /> {/* Production */}
+              <col style={{ width: "100px" }} /> {/* Unit */}
+              <col style={{ width: "115px" }} /> {/* EnPI Value */}
+              <col style={{ width: "125px" }} /> {/* % WRT */}
+            </colgroup>
+
+            {/* HEADERS */}
+            <thead>
+              <tr style={{ color: '#020617', fontWeight: '900', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: '2px solid #000' }}>
+                <th style={{ backgroundColor: "#94a3b8", padding: "12px 6px", borderRight: "2px solid #000" }}>#</th>
+                <th style={{ backgroundColor: "#38bdf8", padding: "12px 8px", borderRight: "2px solid #000", textAlign: "left" }}>Parameters / Equipment</th>
+                <th style={{ backgroundColor: "#fde047", padding: "12px 6px", borderRight: "2px solid #000" }}>Month-Year</th>
+                <th style={{ backgroundColor: "#4ade80", padding: "12px 6px", borderRight: "2px solid #000" }}>Electricity (kWh)</th>
+                <th style={{ backgroundColor: "#fb923c", padding: "12px 4px", borderRight: "2px solid #000" }}>{quantityMonth(selectedMonth) ? "LNG/LPG (kg)" : "LNG/LPG (kWh)"}</th>
+                <th style={{ backgroundColor: "#c084fc", padding: "12px 6px", borderRight: "2px solid #000" }}>{quantityMonth(selectedMonth) ? "HSD (Ltr)" : "HSD (kWh)"}</th>
+                <th style={{ backgroundColor: "#2dd4bf", padding: "12px 6px", borderRight: "2px solid #000" }}> <TotalFormulaControl plant="hsu" month={selectedMonth} formula={formula} onSave={saveFormula} disabled={saving||loading||Boolean(loadError)} saving={saving}/> </th>
+                <th style={{ backgroundColor: "#60a5fa", padding: "12px 6px", borderRight: "2px solid #000" }}>Production (MT)</th>
+                <th style={{ backgroundColor: "#a5b4fc", padding: "12px 6px", borderRight: "2px solid #000" }}>EnPI Unit</th>
+                <th style={{ backgroundColor: "#f472b6", padding: "12px 6px", borderRight: "2px solid #000" }}>EnPI Value(s)</th>
+                <th style={{ backgroundColor: "#facc15", padding: "12px 6px" }}>% WRT to Total</th>
+              </tr>
+            </thead>
+
+            {/* ROW CELLS */}
+            <tbody>
+              {rows.map((r, idx) => {
+                const config = PERMANENT_EQUIPMENTS[idx] || {};
+
+                return (
+                  <tr key={idx} data-equipment={r.equipment} style={{ borderBottom: '1px solid #000', fontWeight: 'bold' }}>
+                    {/* Index */}
+                    <td style={{ backgroundColor: COL_COLORS.index, padding: '10px 4px', borderRight: '2px solid #000', color: '#0f172a', fontWeight: '900' }}>
+                      {idx + 1}
+                    </td>
+
+                    {/* Parameter / Equipment Name */}
+                    <td style={{ backgroundColor: config.labelBg || '#0284c7', color: config.textCol || '#ffffff', padding: '10px 8px', borderRight: '2px solid #000', textAlign: 'left', fontWeight: '900', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      <Link style={{color: 'inherit', textDecoration: 'underline', textUnderlineOffset: '4px'}} to={`/equipment/hsu?${new URLSearchParams({equipment: r.equipment, month: selectedMonth})}`}>{r.equipment} ↗</Link>
+                    </td>
+
+                    {/* Month Column (Expanded) */}
+                    <td style={{ backgroundColor: COL_COLORS.month, padding: '8px', borderRight: '2px solid #000', color: '#78350f', fontWeight: '900' }}>
+                      {selectedMonth}
+                    </td>
+
+                    {/* Electricity Column */}
+                    <td style={{ backgroundColor: COL_COLORS.electricity, padding: '6px', borderRight: '2px solid #000' }}>
+                      <input 
+                        type="number"
+                        disabled={saving} value={r.electricity}
+                        onChange={(e) => handleCellChange(idx, 'electricity', e.target.value)}
+                        placeholder="—"
+                        style={{ width: '100%', textAlign: 'center', backgroundColor: '#ffffff', border: '1px solid #065f46', borderRadius: '6px', padding: '4px 2px', fontWeight: '900', color: '#064e3b', outline: 'none', boxSizing: 'border-box' }}
+                      />
+                    </td>
+
+                    {/* LPG Column (Reduced to 75px) */}
+                    <td style={{ backgroundColor: COL_COLORS.lpg, padding: '4px', borderRight: '2px solid #000' }}>
+                      <input 
+                        type="number"
+                        disabled={saving} value={r.lpg}
+                        onChange={(e) => handleCellChange(idx, 'lpg', e.target.value)}
+                        placeholder="—"
+                        style={{ width: '100%', textAlign: 'center', backgroundColor: '#ffffff', border: '1px solid #9a3412', borderRadius: '6px', padding: '4px 1px', fontWeight: '900', color: '#7c2d12', outline: 'none', boxSizing: 'border-box', fontSize: '11px' }}
+                      />
+                      <FuelSelector plant="hsu" row={r} month={selectedMonth} formula={formula} eligible={augustFuel.allows(r.equipment)} disabled={saving||loading} onChange={value=>handleCellChange(idx,'fuelType',value)}/>
+                    </td>
+
+                    {/* HSD Column */}
+                    <td style={{ backgroundColor: COL_COLORS.hsd, padding: '6px', borderRight: '2px solid #000' }}>
+                      <input 
+                        type="number"
+                        disabled={saving} value={r.hsd}
+                        onChange={(e) => handleCellChange(idx, 'hsd', e.target.value)}
+                        placeholder="—"
+                        style={{ width: '100%', textAlign: 'center', backgroundColor: '#ffffff', border: '1px solid #6b21a8', borderRadius: '6px', padding: '4px 2px', fontWeight: '900', color: '#581c87', outline: 'none', boxSizing: 'border-box' }}
+                      />
+                    </td>
+
+                    {/* Total Consumption Column */}
+                    <td style={{ backgroundColor: COL_COLORS.total, padding: '8px', borderRight: '2px solid #000', color: '#064e3b', fontWeight: '900' }}>
+                      {r.totalConsumption !== '' && r.totalConsumption != null ? Number(r.totalConsumption).toLocaleString() : '—'}
+                    </td>
+
+                    {/* Production Column */}
+                    <td style={{ backgroundColor: COL_COLORS.production, padding: '6px', borderRight: '2px solid #000' }}>
+                      <input 
+                        type="number"
+                        disabled={saving} value={r.production}
+                        onChange={(e) => handleCellChange(idx, 'production', e.target.value)}
+                        placeholder="—"
+                        style={{ width: '100%', textAlign: 'center', backgroundColor: '#ffffff', border: '1px solid #0369a1', borderRadius: '6px', padding: '4px 2px', fontWeight: '900', color: '#0c4a6e', outline: 'none', boxSizing: 'border-box' }}
+                      />
+                    </td>
+
+                    {/* EnPI Unit Column */}
+                    <td style={{ backgroundColor: COL_COLORS.unit, padding: '8px', borderRight: '2px solid #000', color: '#312e81', fontWeight: '900' }}>
+                      {r.enpiUnit}
+                    </td>
+
+                    {/* EnPI Value Column */}
+                    <td style={{ backgroundColor: COL_COLORS.enpiVal, padding: '8px', borderRight: '2px solid #000', color: '#831843', fontWeight: '900' }}>
+                      {r.enpiValue !== '' && r.enpiValue != null ? r.enpiValue : '—'}
+                    </td>
+
+                    {/* % WRT to Total KWH Column */}
+                    <td style={{ backgroundColor: COL_COLORS.wrt, padding: '8px', color: '#713f12', fontWeight: '900' }}>
+                      {r.wrtKwh !== '' && r.wrtKwh != null ? (typeof r.wrtKwh === 'number' ? r.wrtKwh.toFixed(4) : r.wrtKwh) : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+
+              {/* TOTAL SUMMARY ROW */}
+              <tr style={{ borderTop: '4px solid #000', color: '#000', fontWeight: '900', fontSize: '13px' }}>
+                <td style={{ backgroundColor: COL_COLORS.index, padding: '12px 6px', borderRight: '2px solid #000' }}>∑</td>
+                <td style={{ backgroundColor: '#0284c7', color: '#ffffff', padding: '12px 8px', borderRight: '2px solid #000', textAlign: 'left', textTransform: 'uppercase' }}>
+                  Total HSU Facility
+                </td>
+                <td style={{ backgroundColor: COL_COLORS.month, padding: '12px 6px', borderRight: '2px solid #000' }}>{selectedMonth}</td>
+                <td style={{ backgroundColor: COL_COLORS.electricity, padding: '12px 6px', borderRight: '2px solid #000' }}>{totals.electricity > 0 ? totals.electricity.toLocaleString() : '—'}</td>
+                <td style={{ backgroundColor: COL_COLORS.lpg, padding: '12px 4px', borderRight: '2px solid #000' }}>{totals.lpg > 0 ? totals.lpg.toLocaleString() : '—'}</td>
+                <td style={{ backgroundColor: COL_COLORS.hsd, padding: '12px 6px', borderRight: '2px solid #000' }}>{totals.hsd > 0 ? totals.hsd.toLocaleString() : '—'}</td>
+                <td style={{ backgroundColor: COL_COLORS.total, padding: '12px 6px', borderRight: '2px solid #000' }}>{totals.totalConsumption > 0 ? totals.totalConsumption.toLocaleString() : '—'}</td>
+                <td style={{ backgroundColor: COL_COLORS.production, padding: '12px 6px', borderRight: '2px solid #000' }}>{totals.production > 0 ? totals.production.toLocaleString() : '—'}</td>
+                <td style={{ backgroundColor: COL_COLORS.unit, padding: '12px 6px', borderRight: '2px solid #000' }}></td>
+                <td style={{ backgroundColor: COL_COLORS.enpiVal, padding: '12px 6px', borderRight: '2px solid #000' }}>{totals.production > 0 ? totalEnpiVal : '—'}</td>
+                <td style={{ backgroundColor: COL_COLORS.wrt, padding: '12px 6px' }}>{totals.totalConsumption > 0 ? '100%' : '—'}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* 3. CHARTS ANALYTICS GRID: BIG, GLOWING & COLORFUL TITLES */}
+      <div style={{ marginTop: '8px' }}>
+        <h2 style={{ fontSize: '22px', fontWeight: '900', marginBottom: '20px', letterSpacing: '1px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ color: '#d946ef', fontSize: '26px' }}>▍</span> 
+          <span style={{ color: '#00e5ff', textShadow: '0 0 12px rgba(0,229,255,0.6)' }}>HSU</span>
+          <span style={{ color: '#38bdf8' }}>FACILITY</span>
+          <span style={{ color: '#facc15' }}>&amp;</span>
+          <span style={{ color: '#fb923c', textShadow: '0 0 12px rgba(251,146,60,0.6)' }}>CONSUMPTION</span>
+          <span style={{ color: '#4ade80', textShadow: '0 0 12px rgba(74,222,128,0.6)' }}>ANALYTICS</span>
+        </h2>
+
+        <div className="audit-chart-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '24px' }}>
+          
+          {/* CHART 1: TOTAL CONSUMPTION BREAKDOWN */}
+          <div style={{ background: 'linear-gradient(180deg, #0f172a 0%, #082f49 100%)', border: '2px solid #0284c7', borderRadius: '24px', padding: '20px', boxShadow: '0 20px 30px rgba(2,132,199,0.2)', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            <div style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid rgba(56, 189, 248, 0.3)', paddingBottom: '12px', marginBottom: '8px' }}>
+              <h3 style={{ margin: 0, fontSize: '13px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '1px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ color: '#00e5ff' }}>Total</span>
+                <span style={{ color: '#38bdf8' }}>Consumption</span>
+                <span style={{ color: '#facc15' }}>Breakdown</span>
+              </h3>
+              <span style={{ fontSize: '11px', fontWeight: '900', color: '#00e5ff', backgroundColor: 'rgba(0,229,255,0.15)', border: '1px solid #00e5ff', padding: '2px 8px', borderRadius: '12px' }}>
+                kWh
+              </span>
+            </div>
+
+            <ConsumptionBreakdownView data={getCategorizedData('totalConsumption')} colors={PIE_COLORS}>
+            <div style={{ width: '100%', height: 360 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={getCategorizedData('totalConsumption')}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="48%"
+                    outerRadius={115}
+                    innerRadius={60}
+                    paddingAngle={4}
+                    labelLine={{ stroke: '#38bdf8', strokeWidth: 1.5 }}
+                    label={({ percent }) => `${(percent * 100).toFixed(1)}%`}
+                  >
+                    {getCategorizedData('totalConsumption').map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={PIE_COLORS[index % PIE_COLORS.length]} stroke="#ffffff" strokeWidth={2.5} />
+                    ))}
+                  </Pie>
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#030712', borderColor: '#0284c7', borderRadius: '14px', color: '#38bdf8', fontSize: '12px', fontWeight: '900' }}
+                    formatter={(value) => [`${Number(value).toLocaleString()} kWh`, 'Consumption']} 
+                  />
+                  <Legend 
+                    verticalAlign="bottom" 
+                    iconType="circle"
+                    formatter={(val) => <span style={{ color: '#7dd3fc', fontWeight: 'bold', fontSize: '11px' }}>{val}</span>}
+                    wrapperStyle={{ paddingTop: '10px' }} 
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </ConsumptionBreakdownView>
+          </div>
+
+          {/* CHART 2: PRODUCTION BREAKDOWN */}
+          <div style={{ background: 'linear-gradient(180deg, #0f172a 0%, #064e3b 100%)', border: '2px solid #059669', borderRadius: '24px', padding: '20px', boxShadow: '0 20px 30px rgba(5,150,105,0.2)', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            <div style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid rgba(52, 211, 153, 0.3)', paddingBottom: '12px', marginBottom: '8px' }}>
+              <h3 style={{ margin: 0, fontSize: '13px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '1px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ color: '#00e676' }}>Production</span>
+                <span style={{ color: '#34d399' }}>Breakdown</span>
+                <span style={{ color: '#a3e635' }}>(MT)</span>
+              </h3>
+              <span style={{ fontSize: '11px', fontWeight: '900', color: '#00e676', backgroundColor: 'rgba(0,230,118,0.15)', border: '1px solid #00e676', padding: '2px 8px', borderRadius: '12px' }}>
+                MT
+              </span>
+            </div>
+
+            <ProductionBreakdownView data={productionChartData(rows)} colors={PIE_COLORS}>
+            <div style={{ width: '100%', height: 360 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={productionChartData(rows)}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="48%"
+                    outerRadius={115}
+                    innerRadius={60}
+                    paddingAngle={4}
+                    labelLine={{ stroke: '#34d399', strokeWidth: 1.5 }}
+                    label={({ percent }) => `${(percent * 100).toFixed(1)}%`}
+                  >
+                    {productionChartData(rows).map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={PIE_COLORS[(index + 2) % PIE_COLORS.length]} stroke="#ffffff" strokeWidth={2.5} />
+                    ))}
+                  </Pie>
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#030712', borderColor: '#059669', borderRadius: '14px', color: '#34d399', fontSize: '12px', fontWeight: '900' }}
+                    formatter={(value) => [`${Number(value).toLocaleString()} MT`, 'Production']} 
+                  />
+                  <Legend 
+                    verticalAlign="bottom" 
+                    iconType="circle"
+                    formatter={(val) => <span style={{ color: '#86efac', fontWeight: 'bold', fontSize: '11px' }}>{val}</span>}
+                    wrapperStyle={{ paddingTop: '10px' }} 
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </ProductionBreakdownView>
+          </div>
+
+          {/* CHART 3: ENPI VALUE BREAKDOWN */}
+          <div style={{ background: 'linear-gradient(180deg, #0f172a 0%, #4c1d95 100%)', border: '2px solid #7c3aed', borderRadius: '24px', padding: '20px', boxShadow: '0 20px 30px rgba(124,58,237,0.2)', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            <div style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid rgba(192, 132, 252, 0.3)', paddingBottom: '12px', marginBottom: '8px' }}>
+              <h3 style={{ margin: 0, fontSize: '13px', fontWeight: '900', textTransform: 'uppercase', letterSpacing: '1px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ color: '#d500f9' }}>EnPI</span>
+                <span style={{ color: '#e879f9' }}>Value</span>
+                <span style={{ color: '#f43f5e' }}>Breakdown</span>
+              </h3>
+              <span style={{ fontSize: '11px', fontWeight: '900', color: '#d500f9', backgroundColor: 'rgba(213,0,249,0.15)', border: '1px solid #d500f9', padding: '2px 8px', borderRadius: '12px' }}>
+                Metric
+              </span>
+            </div>
+
+            <EnpiBreakdownView data={getCategorizedData('enpiValue')} colors={PIE_COLORS}>
+<ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={getCategorizedData('enpiValue')}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="48%"
+                    outerRadius={115}
+                    innerRadius={60}
+                    paddingAngle={4}
+                    labelLine={{ stroke: '#c084fc', strokeWidth: 1.5 }}
+                    label={({ percent }) => `${(percent * 100).toFixed(1)}%`}
+                  >
+                    {getCategorizedData('enpiValue').map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={PIE_COLORS[(index + 4) % PIE_COLORS.length]} stroke="#ffffff" strokeWidth={2.5} />
+                    ))}
+                  </Pie>
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#030712', borderColor: '#7c3aed', borderRadius: '14px', color: '#c084fc', fontSize: '12px', fontWeight: '900' }}
+                    formatter={(value) => [Number(value).toLocaleString(), 'EnPI Metric']} 
+                  />
+                  <Legend 
+                    verticalAlign="bottom" 
+                    iconType="circle"
+                    formatter={(val) => <span style={{ color: '#d8b4fe', fontWeight: 'bold', fontSize: '11px' }}>{val}</span>}
+                    wrapperStyle={{ paddingTop: '10px' }} 
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </EnpiBreakdownView>
+          </div>
+
+        </div>
+
+        <EnpiTargets plant="hsu" rows={rows} selectedMonth={selectedMonth} loading={loading} error={loadError} />
+        <EquipmentBarCharts rows={rows} selectedMonth={selectedMonth} loading={loading} error={loadError} />
+      </div>
+
+    </div>
+  );
+}
